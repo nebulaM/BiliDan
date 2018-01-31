@@ -369,7 +369,7 @@ def biligrab(url, *, debug=False, verbose=False, tls=False, media=None, comment=
     logging.info('Launching media player...')
     player_exit_code = launch_player(video_metadata, media_urls, comment_out, increase_fps=not keep_fps)
 
-    if comment is None and player_exit_code == 0 and not save_comment:
+    if comment is None and player_exit_code == 0:
         os.remove(comment_out.name)
 
     return player_exit_code
