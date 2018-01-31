@@ -358,7 +358,7 @@ def biligrab(url, *, debug=False, verbose=False, tls=False, media=None, comment=
             if media is not None:
                 comment_dir = os.path.join(os.path.dirname(media), 'comment')
             else:
-                comment_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'comment')
+                comment_dir = os.path.join(os.path.dirname(__file__), 'comment')
             if not os.path.isdir(comment_dir):
                 os.mkdir(comment_dir)
         comment_out = convert_comments(video_metadata['title'], video_metadata['cid'], video_size, comment_dir)
