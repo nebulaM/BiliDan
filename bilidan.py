@@ -50,6 +50,7 @@ import urllib.parse
 import urllib.request
 import xml.dom.minidom
 import zlib
+from datetime import datetime
 
 
 USER_AGENT_PLAYER = 'Mozilla/5.0 BiliDroid/4.24.0 (bbcallen@gmail.com)'
@@ -58,12 +59,14 @@ APPKEY = '1q8o6' + 'r7q4523' + '3436'   # Unknown source
 APPSEC = '560p52ppq288' + 'srq045859rq18' + 'ossq973'    # Do not abuse please, get one yourself if you need
 BILIGRAB_HEADER = {'User-Agent': USER_AGENT_API, 'Cache-Control': 'no-cache', 'Pragma': 'no-cache'}
 
+FFPROBE = 'ffprobe'
+MPV = 'mpv'
 
 def tlsify(url):
     return re.sub(r'http', 'https', url)
 
 
-def biligrab(url, *, debug=False, verbose=False, tls=False, media=None, comment=None, cookie=None, quality=None, source=None, keep_fps=False, mpvflags=[], d2aflags={}, fakeip=None):
+def biligrab(url, *, debug=False, verbose=False, tls=False, media=None, comment=None, cookie=None, quality=None, source=None, keep_fps=False, mpvflags=[], d2aflags={}, fakeip=None, save_comment=False):
 
     url_get_metadata = 'http://api.bilibili.com/view?'
     url_get_comment = 'http://comment.bilibili.com/%(cid)s.xml'
@@ -206,9 +209,9 @@ def biligrab(url, *, debug=False, verbose=False, tls=False, media=None, comment=
         '''
         try:
             if media_urls[0].startswith('http:') or media_urls[0].startswith('https:'):
-                ffprobe_command = ['ffprobe', '-icy', '0', '-loglevel', 'repeat+warning' if verbose else 'repeat+error', '-print_format', 'json', '-select_streams', 'v', '-show_streams', '-timeout', '60000000', '-user-agent', USER_AGENT_PLAYER, '--', media_urls[0]]
+                ffprobe_command = [FFPROBE, '-icy', '0', '-loglevel', 'repeat+warning' if verbose else 'repeat+error', '-print_format', 'json', '-select_streams', 'v', '-show_streams', '-timeout', '60000000', '-user-agent', USER_AGENT_PLAYER, '--', media_urls[0]]
             else:
-                ffprobe_command = ['ffprobe', '-loglevel', 'repeat+warning' if verbose else 'repeat+error', '-print_format', 'json', '-select_streams', 'v', '-show_streams', '--', media_urls[0]]
+                ffprobe_command = [FFPROBE, '-loglevel', 'repeat+warning' if verbose else 'repeat+error', '-print_format', 'json', '-select_streams', 'v', '-show_streams', '--', media_urls[0]]
             log_command(ffprobe_command)
             ffprobe_process = subprocess.Popen(ffprobe_command, stdout=subprocess.PIPE)
             try:
@@ -226,15 +229,20 @@ def biligrab(url, *, debug=False, verbose=False, tls=False, media=None, comment=
             log_or_raise(e, debug=debug)
             return 0, 0
 
-    def convert_comments(cid, video_size):
+    def convert_comments(title, cid, video_size, comment_dir=None):
         '''Convert comments to ASS subtitle format
 
-        Arguments: cid
+        Arguments: title, cid, video_size
 
         Return value: comment_out -> file
         '''
         _, resp_comment = fetch_url(url_get_comment % {'cid': cid}, cookie=cookie)
         comment_in = io.StringIO(resp_comment.decode('utf-8', 'replace'))
+        if comment_dir is not None:
+            comment_xml_name = os.path.join(comment_dir, title + datetime.now().strftime(' %Y_%m_%d_%H_%M_%S') + '.xml')
+            with open(comment_xml_name, 'wb') as f:
+                f.write(resp_comment)
+            logging.info('Saved original comment xml to %s' % (comment_xml_name))
         comment_out = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8-sig', newline='\r\n', prefix='tmp-danmaku2ass-', suffix='.ass', delete=False)
         logging.info('Invoking Danmaku2ASS, converting to %s' % comment_out.name)
         d2a_args = dict({'stage_width': video_size[0], 'stage_height': video_size[1], 'font_face': 'SimHei', 'font_size': math.ceil(video_size[1] / 21.6), 'text_opacity': 0.8, 'duration_marquee': min(max(6.75 * video_size[0] / video_size[1] - 4, 3.0), 8.0), 'duration_still': 5.0}, **d2aflags)
@@ -254,7 +262,7 @@ def biligrab(url, *, debug=False, verbose=False, tls=False, media=None, comment=
     def launch_player(video_metadata, media_urls, comment_out, is_playlist=False, increase_fps=True):
         '''Launch MPV media player
 
-        Arguments: video_metadata, media_urls, comment_out
+        Arguments: video_metadata, media_urls, comment_out, save_comment
 
         Return value: player_exit_code -> int
         '''
@@ -271,7 +279,7 @@ def biligrab(url, *, debug=False, verbose=False, tls=False, media=None, comment=
                 if 'vdpau' in i or 'vaapi' in i or 'vda' in i:
                     increase_fps = False
                     break
-        command_line = ['mpv', '--autofit', '950x540']
+        command_line = [MPV, '--autofit', '950x540']
         if mpv_version_gte_0_6:
             command_line += ['--cache-file', 'TMP']
         if increase_fps and mpv_version_gte_0_6:  # Drop frames at vo side but not at decoder side to prevent A/V sync issues
@@ -324,6 +332,7 @@ def biligrab(url, *, debug=False, verbose=False, tls=False, media=None, comment=
         video_metadata = fetch_video_metadata(aid, pid)
     else:
         video_metadata = {'cid': aid, 'title': url}
+
     logging.info('Got video cid: %s' % video_metadata['cid'])
 
     logging.info('Loading video content...')
@@ -344,7 +353,15 @@ def biligrab(url, *, debug=False, verbose=False, tls=False, media=None, comment=
 
     logging.info('Loading comments...')
     if comment is None:
-        comment_out = convert_comments(video_metadata['cid'], video_size)
+        comment_dir = None
+        if save_comment is True:
+            if media is not None:
+                comment_dir = os.path.join(os.path.dirname(media), 'comment')
+            else:
+                comment_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'comment')
+            if not os.path.isdir(comment_dir):
+                os.mkdir(comment_dir)
+        comment_out = convert_comments(video_metadata['title'], video_metadata['cid'], video_size, comment_dir)
     else:
         comment_out = open(comment, 'r')
         comment_out.close()
@@ -352,7 +369,7 @@ def biligrab(url, *, debug=False, verbose=False, tls=False, media=None, comment=
     logging.info('Launching media player...')
     player_exit_code = launch_player(video_metadata, media_urls, comment_out, increase_fps=not keep_fps)
 
-    if comment is None and player_exit_code == 0:
+    if comment is None and player_exit_code == 0 and not save_comment:
         os.remove(comment_out.name)
 
     return player_exit_code
@@ -404,6 +421,7 @@ def andro_mock(tls, params):
     logging.debug('Our simulated API level: %s, latest API level: %s' % (our_lvl, api_lvl))
     if api_lvl > our_lvl:
         logging.warning('Bilibili API server indicates the API protocol has been updated, the extraction may not work!')
+        logging.warning('Our simulated API level: %s, latest API level: %s' % (our_lvl, api_lvl))
     fake_hw = codecs.encode(random.Random().randrange(start=0, stop=18000000000000000084).to_bytes(8, 'big'), 'hex_codec')
     add_req_args = collections.OrderedDict({
         'platform': 'android',
@@ -465,7 +483,7 @@ def check_env(debug=False):
             logging.error('Danmaku2ASS module is not working (%s), please update it at https://github.com/m13253/danmaku2ass' % e)
             retval = False
     try:
-        mpv_process = subprocess.Popen(('mpv', '--version'), stdout=subprocess.PIPE, env=dict(os.environ, MPV_VERBOSE='-1'))
+        mpv_process = subprocess.Popen((MPV, '--version'), stdout=subprocess.PIPE, env=dict(os.environ, MPV_VERBOSE='-1'))
         mpv_output = mpv_process.communicate()[0].decode('utf-8', 'replace').splitlines()
         for line in mpv_output:
             if line.startswith('[cplayer] mpv '):
@@ -479,7 +497,7 @@ def check_env(debug=False):
         logging.error('Please install \'mpv\' as the media player.')
         retval = False
     try:
-        mpv_process = subprocess.Popen(('mpv', '--vf', 'lavfi=help'), stdout=subprocess.DEVNULL)
+        mpv_process = subprocess.Popen((MPV, '--vf', 'lavfi=help'), stdout=subprocess.DEVNULL)
         mpv_process.wait()
         if mpv_process.returncode != 0:
             logging.error('mpv is not configured to enable \'lavfi\' filter. (mpv or ffmpeg may be too old)')
@@ -488,7 +506,7 @@ def check_env(debug=False):
         logging.error('mpv is not configured to enable \'lavfi\' filter. (mpv or ffmpeg may be too old)')
         retval = False
     try:
-        subprocess.Popen(('ffprobe', '-version'), stdout=subprocess.DEVNULL)
+        subprocess.Popen((FFPROBE, '-version'), stdout=subprocess.DEVNULL)
     except OSError as e:
         logging.error('Please install \'ffprobe\' from FFmpeg ultilities.')
         retval = False
@@ -518,8 +536,14 @@ def preprocess_url(url):
     :return:
     """
     regex = re.compile('(https?://bangumi.bilibili.com/anime/v/[0-9]+)')
+    renum = re.compile('(av)?[0-9]+')
     regex_match = regex.match(url)
     if not regex_match:
+        if renum.match(url):
+            if 'av' in url:
+                return 'https://www.bilibili.com/video/' + url
+            else:
+                return 'https://www.bilibili.com/video/av' + url
         return url
 
     # extract Bilibili url from raw HTML.
@@ -579,6 +603,7 @@ def main():
     parser.add_argument('--keep-fps', action='store_true', help='Use the same framerate as the video to animate comments, instead of increasing to 60 fps')
     parser.add_argument('--mpvflags', metavar='FLAGS', default='', help='Parameters passed to mpv, formed as \'--option1=value1 --option2=value2\'')
     parser.add_argument('--d2aflags', '--danmaku2assflags', metavar='FLAGS', default='', help='Parameters passed to Danmaku2ASS, formed as \'option1=value1,option2=value2\'')
+    parser.add_argument('-sc', '--save-comment', action='store_true', help='Save original xml comment file to a folder. Path to folder depends on whether -m is defined.')
     parser.add_argument('url', metavar='URL', nargs='+', help='Bilibili video page URL (http(s)://www.bilibili.com/video/av*/)')
     args = parser.parse_args()
     logging.basicConfig(format='%(levelname)s: %(message)s', level=logging.DEBUG if args.verbose else logging.INFO)
@@ -597,7 +622,7 @@ def main():
         # if url is a Bangumi format URL (e.g. http://bangumi.bilibili.com/anime/v/80085)
         url = preprocess_url(url)
         try:
-            retval = retval or biligrab(url, debug=args.debug, verbose=args.verbose, tls=args.tls, media=args.media, comment=args.comment, cookie=args.cookie, quality=quality, source=source, keep_fps=args.keep_fps, mpvflags=mpvflags, d2aflags=d2aflags, fakeip=args.fakeip)
+            retval = retval or biligrab(url, debug=args.debug, verbose=args.verbose, tls=args.tls, media=args.media, comment=args.comment, cookie=args.cookie, quality=quality, source=source, keep_fps=args.keep_fps, mpvflags=mpvflags, d2aflags=d2aflags, fakeip=args.fakeip, save_comment=args.save_comment)
         except OSError as e:
             logging.error(e)
             retval = retval or e.errno
@@ -609,7 +634,6 @@ def main():
             if args.debug:
                 raise
     return retval
-
 
 if __name__ == '__main__':
     sys.exit(main())
