@@ -200,35 +200,6 @@ def biligrab(url, *, debug=False, verbose=False, tls=False, media=None, comment=
             media_urls = [tlsify(u) for u in media_urls]
         return media_urls
 
-    def get_video_size(media_urls):
-        '''Determine the resolution of the video
-
-        Arguments: [media_urls]
-
-        Return value: (width, height)
-        '''
-        try:
-            if media_urls[0].startswith('http:') or media_urls[0].startswith('https:'):
-                ffprobe_command = [FFPROBE, '-icy', '0', '-loglevel', 'repeat+warning' if verbose else 'repeat+error', '-print_format', 'json', '-select_streams', 'v', '-show_streams', '-timeout', '60000000', '-user-agent', USER_AGENT_PLAYER, '--', media_urls[0]]
-            else:
-                ffprobe_command = [FFPROBE, '-loglevel', 'repeat+warning' if verbose else 'repeat+error', '-print_format', 'json', '-select_streams', 'v', '-show_streams', '--', media_urls[0]]
-            log_command(ffprobe_command)
-            ffprobe_process = subprocess.Popen(ffprobe_command, stdout=subprocess.PIPE)
-            try:
-                ffprobe_output = json.loads(ffprobe_process.communicate()[0].decode('utf-8', 'replace'))
-            except KeyboardInterrupt:
-                logging.warning('Cancelling getting video size, press Ctrl-C again to terminate.')
-                ffprobe_process.terminate()
-                return 0, 0
-            width, height, widthxheight = 0, 0, 0
-            for stream in dict.get(ffprobe_output, 'streams') or []:
-                if dict.get(stream, 'width') * dict.get(stream, 'height') > widthxheight:
-                    width, height = dict.get(stream, 'width'), dict.get(stream, 'height')
-            return width, height
-        except Exception as e:
-            log_or_raise(e, debug=debug)
-            return 0, 0
-
     def convert_comments(title, cid, video_size, comment_dir=None):
         '''Convert comments to ASS subtitle format
 
@@ -243,87 +214,7 @@ def biligrab(url, *, debug=False, verbose=False, tls=False, media=None, comment=
             with open(comment_xml_name, 'wb') as f:
                 f.write(resp_comment)
             logging.info('Saved original comment xml to %s' % (comment_xml_name))
-        comment_out = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8-sig', newline='\r\n', prefix='tmp-danmaku2ass-', suffix='.ass', delete=False)
-        logging.info('Invoking Danmaku2ASS, converting to %s' % comment_out.name)
-        d2a_args = dict({'stage_width': video_size[0], 'stage_height': video_size[1], 'font_face': 'SimHei', 'font_size': math.ceil(video_size[1] / 21.6), 'text_opacity': 0.8, 'duration_marquee': min(max(6.75 * video_size[0] / video_size[1] - 4, 3.0), 8.0), 'duration_still': 5.0}, **d2aflags)
-        for i, j in ((('stage_width', 'stage_height', 'reserve_blank'), int), (('font_size', 'text_opacity', 'comment_duration', 'duration_still', 'duration_marquee'), float)):
-            for k in i:
-                if k in d2aflags:
-                    d2a_args[k] = j(d2aflags[k])
-        try:
-            danmaku2ass.Danmaku2ASS(input_files=[comment_in], input_format='Bilibili', output_file=comment_out, **d2a_args)
-        except Exception as e:
-            log_or_raise(e, debug=debug)
-            logging.error('Danmaku2ASS failed, comments are disabled.')
-        comment_out.flush()
-        comment_out.close()  # Close the temporary file early to fix an issue related to Windows NT file sharing
-        return comment_out
-
-    def launch_player(video_metadata, media_urls, comment_out, is_playlist=False, increase_fps=True):
-        '''Launch MPV media player
-
-        Arguments: video_metadata, media_urls, comment_out, save_comment
-
-        Return value: player_exit_code -> int
-        '''
-        mpv_version_master = tuple(int(i) if i.isdigit() else float('inf') for i in check_env.mpv_version.split('-', 1)[0].split('.'))
-        mpv_version_gte_0_10 = mpv_version_master >= (0, 10)
-        mpv_version_gte_0_6 = mpv_version_gte_0_10 or mpv_version_master >= (0, 6)
-        mpv_version_gte_0_4 = mpv_version_gte_0_6 or mpv_version_master >= (0, 4)
-        logging.debug('Compare mpv version: %s %s 0.10' % (check_env.mpv_version, '>=' if mpv_version_gte_0_10 else '<'))
-        logging.debug('Compare mpv version: %s %s 0.6' % (check_env.mpv_version, '>=' if mpv_version_gte_0_6 else '<'))
-        logging.debug('Compare mpv version: %s %s 0.4' % (check_env.mpv_version, '>=' if mpv_version_gte_0_4 else '<'))
-        if increase_fps:  # If hardware decoding (without -copy suffix) is used, do not increase fps
-            for i in mpvflags:
-                i = i.split('=', 1)
-                if 'vdpau' in i or 'vaapi' in i or 'vda' in i:
-                    increase_fps = False
-                    break
-        command_line = [MPV, '--autofit', '950x540']
-        if mpv_version_gte_0_6:
-            command_line += ['--cache-file', 'TMP']
-        if increase_fps and mpv_version_gte_0_6:  # Drop frames at vo side but not at decoder side to prevent A/V sync issues
-            command_line += ['--framedrop', 'vo']
-        command_line += ['--http-header-fields', 'User-Agent: ' + USER_AGENT_PLAYER.replace(',', '\\,')]
-        if mpv_version_gte_0_6:
-            if mpv_version_gte_0_10:
-                command_line += ['--force-media-title', video_metadata.get('title', url)]
-            else:
-                command_line += ['--media-title', video_metadata.get('title', url)]
-        if is_playlist or len(media_urls) > 1:
-            command_line += ['--merge-files']
-        if mpv_version_gte_0_4:
-            command_line += ['--no-video-aspect', '--sub-ass', '--sub-file', comment_out.name]
-        else:
-            command_line += ['--no-aspect', '--ass', '--sub', comment_out.name]
-        if increase_fps:
-            if mpv_version_gte_0_6:
-                command_line += ['--vf', 'lavfi="fps=fps=60:round=down"']
-            else:  # Versions < 0.6 have an A/V sync related issue
-                command_line += ['--vf', 'lavfi="fps=fps=50:round=down"']
-        command_line += mpvflags
-        if is_playlist:
-            command_line += ['--playlist']
-        else:
-            command_line += ['--']
-        command_line += media_urls
-        log_command(command_line)
-        player_process = subprocess.Popen(command_line)
-        try:
-            player_process.wait()
-        except KeyboardInterrupt:
-            logging.info('Terminating media player...')
-            try:
-                player_process.terminate()
-                try:
-                    player_process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    logging.info('Killing media player by force...')
-                    player_process.kill()
-            except Exception:
-                pass
-            raise
-        return player_process.returncode
+        return get_comment_ass(video_size, comment_in, 'Bilibili', d2aflags)
 
     aid, pid = parse_url(url)
 
@@ -343,7 +234,7 @@ def biligrab(url, *, debug=False, verbose=False, tls=False, media=None, comment=
     logging.info('Got media URLs:' + ''.join(('\n      %d: %s' % (i + 1, j) for i, j in enumerate(media_urls))))
 
     logging.info('Determining video resolution...')
-    video_size = get_video_size(media_urls)
+    video_size = get_video_size(media_urls, debug)
     logging.info('Video resolution: %sx%s' % video_size)
     if video_size[0] > 0 and video_size[1] > 0:
         video_size = (video_size[0] * 1080 / video_size[1], 1080)  # Simply fix ASS resolution to 1080p
@@ -362,14 +253,14 @@ def biligrab(url, *, debug=False, verbose=False, tls=False, media=None, comment=
             if not os.path.isdir(comment_dir):
                 os.mkdir(comment_dir)
         comment_out = convert_comments(video_metadata['title'], video_metadata['cid'], video_size, comment_dir)
+    # use local xml comment file
     else:
-        comment_out = open(comment, 'r')
-        comment_out.close()
+        comment_out = get_comment_ass(video_size, comment, 'Bilibili', d2aflags)
 
     logging.info('Launching media player...')
-    player_exit_code = launch_player(video_metadata, media_urls, comment_out, increase_fps=not keep_fps)
+    player_exit_code = launch_player(video_metadata.get('title', url), media_urls, comment_out, increase_fps=not keep_fps, mpvflags=mpvflags)
 
-    if comment is None and player_exit_code == 0:
+    if player_exit_code == 0:
         os.remove(comment_out.name)
 
     return player_exit_code
@@ -572,6 +463,164 @@ def preprocess_url(url):
     return result
 
 
+def get_video_size(media_urls, debug=False, verbose=False):
+    '''Determine the resolution of the video
+
+    Arguments: [media_urls]
+
+    Return value: (width, height)
+    '''
+    try:
+        if media_urls[0].startswith('http:') or media_urls[0].startswith('https:'):
+            ffprobe_command = [FFPROBE, '-icy', '0', '-loglevel', 'repeat+warning' if verbose else 'repeat+error', '-print_format', 'json', '-select_streams', 'v', '-show_streams', '-timeout', '60000000', '-user-agent', USER_AGENT_PLAYER, '--', media_urls[0]]
+        else:
+            ffprobe_command = [FFPROBE, '-loglevel', 'repeat+warning' if verbose else 'repeat+error', '-print_format', 'json', '-select_streams', 'v', '-show_streams', '--', media_urls[0]]
+        log_command(ffprobe_command)
+        ffprobe_process = subprocess.Popen(ffprobe_command, stdout=subprocess.PIPE)
+        try:
+            ffprobe_output = json.loads(ffprobe_process.communicate()[0].decode('utf-8', 'replace'))
+        except KeyboardInterrupt:
+            logging.warning('Cancelling getting video size, press Ctrl-C again to terminate.')
+            ffprobe_process.terminate()
+            return 0, 0
+        width, height, widthxheight = 0, 0, 0
+        for stream in dict.get(ffprobe_output, 'streams') or []:
+            if dict.get(stream, 'width') * dict.get(stream, 'height') > widthxheight:
+                width, height = dict.get(stream, 'width'), dict.get(stream, 'height')
+        return width, height
+    except Exception as e:
+        log_or_raise(e, debug=debug)
+        return 0, 0
+
+
+def get_comment_ass(video_size, comment_in, input_format, d2aflags={}):
+    '''Warpper for danmaku2ass.Danmaku2ASS to get comment in .ass format
+
+    comment_in must be an valid xml comment. It can be either filename or file content
+
+    '''
+    comment_out = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8-sig', newline='\r\n', prefix='tmp-danmaku2ass-', suffix='.ass', delete=False)
+    logging.info('Invoking Danmaku2ASS, converting to %s' % comment_out.name)
+    d2a_args = dict({'stage_width': video_size[0], 'stage_height': video_size[1], 'font_face': 'SimHei', 'font_size': math.ceil(video_size[1] / 21.6), 'text_opacity': 0.8, 'duration_marquee': min(max(6.75 * video_size[0] / video_size[1] - 4, 3.0), 8.0), 'duration_still': 5.0}, **d2aflags)
+    for i, j in ((('stage_width', 'stage_height', 'reserve_blank'), int), (('font_size', 'text_opacity', 'comment_duration', 'duration_still', 'duration_marquee'), float)):
+        for k in i:
+            if k in d2aflags:
+                d2a_args[k] = j(d2aflags[k])
+    try:
+        danmaku2ass.Danmaku2ASS(input_files=[comment_in], input_format=input_format, output_file=comment_out, **d2a_args)
+    except Exception as e:
+        log_or_raise(e, debug=debug)
+        logging.error('Danmaku2ASS failed, comments are disabled.')
+    comment_out.flush()
+    comment_out.close()  # Close the temporary file early to fix an issue related to Windows NT file sharing
+    return comment_out
+
+
+def launch_player(video_title, media_urls, comment_out, is_playlist=False, increase_fps=True, mpvflags=[]):
+    '''Launch MPV media player
+
+    Arguments: video_title, media_urls, comment_out, save_comment
+
+    Return value: player_exit_code -> int
+    '''
+    mpv_version_master = tuple(int(i) if i.isdigit() else float('inf') for i in check_env.mpv_version.split('-', 1)[0].split('.'))
+    mpv_version_gte_0_10 = mpv_version_master >= (0, 10)
+    mpv_version_gte_0_6 = mpv_version_gte_0_10 or mpv_version_master >= (0, 6)
+    mpv_version_gte_0_4 = mpv_version_gte_0_6 or mpv_version_master >= (0, 4)
+    logging.debug('Compare mpv version: %s %s 0.10' % (check_env.mpv_version, '>=' if mpv_version_gte_0_10 else '<'))
+    logging.debug('Compare mpv version: %s %s 0.6' % (check_env.mpv_version, '>=' if mpv_version_gte_0_6 else '<'))
+    logging.debug('Compare mpv version: %s %s 0.4' % (check_env.mpv_version, '>=' if mpv_version_gte_0_4 else '<'))
+    if increase_fps:  # If hardware decoding (without -copy suffix) is used, do not increase fps
+        for i in mpvflags:
+            i = i.split('=', 1)
+            if 'vdpau' in i or 'vaapi' in i or 'vda' in i:
+                increase_fps = False
+                break
+    command_line = [MPV, '--autofit', '950x540']
+    if mpv_version_gte_0_6:
+        command_line += ['--cache-file', 'TMP']
+    if increase_fps and mpv_version_gte_0_6:  # Drop frames at vo side but not at decoder side to prevent A/V sync issues
+        command_line += ['--framedrop', 'vo']
+    command_line += ['--http-header-fields', 'User-Agent: ' + USER_AGENT_PLAYER.replace(',', '\\,')]
+    if mpv_version_gte_0_6:
+        if mpv_version_gte_0_10:
+            command_line += ['--force-media-title', video_title]
+        else:
+            command_line += ['--media-title', video_title]
+    if is_playlist or len(media_urls) > 1:
+        command_line += ['--merge-files']
+    if mpv_version_gte_0_4:
+        command_line += ['--no-video-aspect', '--sub-ass', '--sub-file', comment_out.name]
+    else:
+        command_line += ['--no-aspect', '--ass', '--sub', comment_out.name]
+    if increase_fps:
+        if mpv_version_gte_0_6:
+            command_line += ['--vf', 'lavfi="fps=fps=60:round=down"']
+        else:  # Versions < 0.6 have an A/V sync related issue
+            command_line += ['--vf', 'lavfi="fps=fps=50:round=down"']
+    command_line += mpvflags
+    if is_playlist:
+        command_line += ['--playlist']
+    else:
+        command_line += ['--']
+    command_line += media_urls
+    log_command(command_line)
+    player_process = subprocess.Popen(command_line)
+    try:
+        player_process.wait()
+    except KeyboardInterrupt:
+        logging.info('Terminating media player...')
+        try:
+            player_process.terminate()
+            try:
+                player_process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                logging.info('Killing media player by force...')
+                player_process.kill()
+        except Exception:
+            pass
+        raise
+    return player_process.returncode
+
+
+def play_offline(media, comment, debug=False, verbose=False, keep_fps=False, mpvflags=[], d2aflags={}):
+    ''' Play media with comment offline
+
+    Request //path/to/media and //path/to/comment othwerwise assert
+
+    '''
+    logging.info('Loading both media and comment locally.')
+    logging.info('Loading video content...')
+    if media is None:
+        raise AssertionError('play_offline: media cannot be None')
+    else:
+        media_urls = [media]
+    logging.info('Got media URLs:' + ''.join(('\n      %d: %s' % (i + 1, j) for i, j in enumerate(media_urls))))
+
+    logging.info('Determining video resolution...')
+    video_size = get_video_size(media_urls, debug)
+    logging.info('Video resolution: %sx%s' % video_size)
+    if video_size[0] > 0 and video_size[1] > 0:
+        video_size = (video_size[0] * 1080 / video_size[1], 1080)  # Simply fix ASS resolution to 1080p
+    else:
+        log_or_raise(ValueError('Can not get video size. Comments may be wrongly positioned.'), debug=debug)
+        video_size = (1920, 1080)
+
+    logging.info('Loading comments...')
+    if comment is None:
+        raise AssertionError('play_offline: comment cannot be None')
+    else:
+        comment_out = get_comment_ass(video_size, comment, 'Bilibili', d2aflags)
+
+    logging.info('Launching media player...')
+    player_exit_code = launch_player('TBD', media_urls, comment_out, increase_fps=not keep_fps, mpvflags=mpvflags)
+
+    if player_exit_code == 0:
+        os.remove(comment_out.name)
+
+    return player_exit_code
+
+
 class MyArgumentFormatter(argparse.HelpFormatter):
 
     def _split_lines(self, text, width):
@@ -586,8 +635,8 @@ def main():
     parser = argparse.ArgumentParser(formatter_class=MyArgumentFormatter)
     parser.add_argument('-c', '--cookie', help='Import Cookie at bilibili.com, type document.cookie at JavaScript console to acquire it')
     parser.add_argument('-d', '--debug', action='store_true', help='Stop execution immediately when an error occures')
-    parser.add_argument('-m', '--media', help='Specify local media file to play with remote comments')
-    parser.add_argument('--comment', help='Specify local ASS comment file to play with remote media')
+    parser.add_argument('-m', '--media', help='Specify local media file to play with local/remote comments')
+    parser.add_argument('--comment', help='Specify local xml comment file to play with local/remote media')
     parser.add_argument('-q', '--quality', type=int, help='Specify video quality, -q 1 for the lowest, -q 4 for HD')
     parser.add_argument('-s', '--source', help='Specify the source of video provider.\n' +
                                                'Available values:\n' +
@@ -604,7 +653,7 @@ def main():
     parser.add_argument('--mpvflags', metavar='FLAGS', default='', help='Parameters passed to mpv, formed as \'--option1=value1 --option2=value2\'')
     parser.add_argument('--d2aflags', '--danmaku2assflags', metavar='FLAGS', default='', help='Parameters passed to Danmaku2ASS, formed as \'option1=value1,option2=value2\'')
     parser.add_argument('-sc', '--save-comment', action='store_true', help='Save original xml comment file to a folder. Path to folder depends on whether -m is defined.')
-    parser.add_argument('url', metavar='URL', nargs='+', help='Bilibili video page URL (http(s)://www.bilibili.com/video/av*/)')
+    parser.add_argument('-url', metavar='URL', nargs='+', help='Bilibili video page URL (http(s)://www.bilibili.com/video/av*/)')
     args = parser.parse_args()
     logging.basicConfig(format='%(levelname)s: %(message)s', level=logging.DEBUG if args.verbose else logging.INFO)
     if not check_env(debug=args.debug):
@@ -617,6 +666,23 @@ def main():
     d2aflags = dict((i.split('=', 1) if '=' in i else [i, ''] for i in args.d2aflags.split(','))) if args.d2aflags else {}
     fakeip = args.fakeip if args.fakeip else None
     retval = 0
+
+    # try play media offline if url is not given.
+    # this action requests 'media' and 'comment' args 
+    if args.url is None:
+        try:
+            retval = retval or play_offline(media=args.media, comment=args.comment, debug=args.debug, verbose=args.verbose, keep_fps=args.keep_fps, mpvflags=mpvflags, d2aflags=d2aflags)
+        except OSError as e:
+            logging.error(e)
+            retval = retval or e.errno
+            if args.debug:
+                raise
+        except Exception as e:
+            logging.error(e)
+            retval = retval or 1
+            if args.debug:
+                raise
+        return retval
 
     for url in args.url:
         # if url is a Bangumi format URL (e.g. http://bangumi.bilibili.com/anime/v/80085)
